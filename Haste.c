@@ -1,7 +1,13 @@
 // "HASTE"
-
+//
 // ASCII-ART TEXT-BASED ADVENTURE RPG GAME
 // BY MOBIN - 2025
+
+
+// Fixed: 
+//  - attack rendering no longer flashes whole screen grey (uses draw_world_with_hud)
+//  - projectiles/bullets are colored yellow
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,12 +16,53 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
-
+#include <pthread.h> // multi threading (left included as in original)
 
 #define ROWS 20
 #define COLS 40
-#define MAX_ENEMIES 24
-#define DETECTION_RANGE 9   /* how far enemies will try to pathfind (Manhattan) */
+#define MAX_ENEMIES 32
+#define DETECTION_RANGE 9   /* how far enemies will try to pathfind */
+
+#define NORMAL "\033[0m"
+#define BOLD "\033[1m"
+#define GREY "\033[90m"
+#define RESET   "\033[0m"
+#define RED     "\033[31m"
+#define GREEN   "\033[32m"
+#define YELLOW  "\033[33m"
+#define BLUE    "\033[34m"
+#define MAGENTA "\033[35m"
+#define CYAN    "\033[36m"
+#define WHITE   "\033[37m"
+// Bright versions:
+#define BRED    "\033[91m"
+#define BGREEN  "\033[92m"
+#define BYELLOW "\033[93m"
+#define BBLUE   "\033[94m"
+
+#define CLR()   printf("\033[H")     // cursor to home
+#define CLS()   printf("\033[2J\033[H") // clear once at start
+
+// ---------- (Optional) Soundtrack (commented in original) ----------
+/*
+void play_note(int freq, int duration_ms) {
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "beep -f %d -l %d >/dev/null 2>&1", freq, duration_ms);
+    system(cmd);
+}
+void* soundtrack(void* arg) {
+    while (1) {
+        play_note(440, 200);
+        usleep(300000);
+        play_note(523, 200);
+        usleep(300000);
+    }
+    return NULL;
+}
+*/
+
+// ---------- Globals ----------
+static int player_hp_global = 0; // made global so attack functions can call draw_world_with_hud
 
 // ---------- Stats ----------
 typedef struct {
@@ -31,14 +78,13 @@ typedef struct {
 
 ClassModifiers mods;
 
-
 // ---------- Enemies ----------
 typedef struct {
     int hp;
     int dmg;
     int speed;         // how often they move (higher = faster)
     int row, col;      // top-left cell
-    char shape[3];     
+    char shape[3];
     int is_elite;
     int is_boss;
     long last_move;    // µs timestamp for movement cooldown
@@ -49,7 +95,7 @@ typedef struct {
     int alive;
     int width;         // strlen(shape)
 
-    int aggro;   // <-- NEW: whether enemy has spotted the player
+    int aggro;   // whether enemy has spotted the player
 } Enemy;
 
 int calc_damage(const char *cls, Stats s, ClassModifiers m) {
@@ -58,7 +104,6 @@ int calc_damage(const char *cls, Stats s, ClassModifiers m) {
     else base = 3 + s.STR / 4;
     return (int)(base * m.dmg_mult);
 }
-
 
 static Enemy enemies[MAX_ENEMIES];
 static int enemy_count = 0;
@@ -81,9 +126,6 @@ int movement_delay(Stats s, float mult) {
 int attack_delay(Stats s, float mult) {
     return (int)(10000 / (s.SPD > 0 ? s.SPD : 1) / mult);
 }
-
-
-//
 
 // Enemy timing (in µs). Tuned to ~0.8s - 2s range:
 int enemy_move_delay(const Enemy *e) { return 1500000 / (e->speed > 0 ? e->speed : 1); }
@@ -116,15 +158,36 @@ int kbhit(void) {
 
 // ---------- World helpers ----------
 void draw_world(char world[ROWS][COLS+1]) {
-    system("clear");
+    CLR();
     for (int r = 0; r < ROWS; r++) puts(world[r]);
 }
 
+// Draw frame with HUD and colors. Projectiles/bullets are printed in YELLOW.
 void draw_world_with_hud(char world[ROWS][COLS+1], int hp) {
-    system("clear");
+    CLR();
     for (int r = 0; r < ROWS; r++) {
-        printf("%s", world[r]);
-        if (r == 0) printf("   HP: %d", hp);
+        for (int c = 0; c < COLS; c++) {
+            char tile = world[r][c];
+            // projectile / attack symbols -> YELLOW
+            if (tile == '^' || tile == 'v' || tile == '<' || tile == '>' ||
+                tile == '|' || tile == '-' || tile == '*' || tile == '0') {
+                printf(YELLOW "%c" RESET, tile);
+            }
+            else if (tile == 'P') {
+                printf(BBLUE "P" RESET); // player lblue
+            } else if (tile == 'M' || tile == 'Z' || tile == 'X' || tile == 'Y') {
+                printf(BRED "%c" RESET, tile);  // normal enemies l red
+            } else if (tile == 'E') {
+                printf(RED "E" RESET);    // elite
+            } else if (tile == 'B') {
+                printf(MAGENTA "B" RESET);   // boss MAGENTA
+            } else if (tile == '#') {
+                printf(GREY "#" RESET);          // walls grey
+            } else {
+                printf("%c", tile);
+            }
+        }
+        if (r == 0) printf(BOLD RED "   ♡ HP: %d", hp);
         printf("\n");
     }
 }
@@ -277,34 +340,8 @@ int find_next_step_bfs(char world[ROWS][COLS+1], const Enemy *e, int pr, int pc,
 }
 
 // ---------- Player attacks ----------
-
-/*void melee_attack(char world[ROWS][COLS+1], int pr, int pc, char last_dir, int dmg) {
-    int ar = pr, ac = pc; char sym = '?';
-    if (last_dir == 'w') { ar--; sym = '^'; }
-    else if (last_dir == 's') { ar++; sym = 'v'; }
-    else if (last_dir == 'a') { ac--; sym = '<'; }
-    else if (last_dir == 'd') { ac++; sym = '>'; }
-
-    if (ar < 0 || ar >= ROWS || ac < 0 || ac >= COLS) return;
-    if (world[ar][ac] == '#') return;
-
-    // Visual: place attack symbol
-    char prev = world[ar][ac];
-    world[ar][ac] = sym;
-    draw_world(world);
-
-    // Damage logic: apply to enemy if present
-    apply_damage_at(world, ar, ac, dmg);
-
-    // Pause and then restore tile — if an enemy remains there, put its char back
-    usleep(200000);
-    int idx = find_enemy_at(ar, ac);
-    if (idx >= 0 && enemies[idx].alive) {
-        world[ar][ac] = enemies[idx].shape[ac - enemies[idx].col];
-    } else {
-        world[ar][ac] = (prev == '#') ? '#' : ' ';
-    }
-}*/
+// NOTE: these functions now call draw_world_with_hud(..., player_hp_global)
+// so we can keep colors during attack animations.
 
 // Mage projectile: travels, damages enemies, stops on first hit
 void mage_attack(char world[ROWS][COLS+1], int pr, int pc, char last_dir, int dmg) {
@@ -322,7 +359,7 @@ void mage_attack(char world[ROWS][COLS+1], int pr, int pc, char last_dir, int dm
 
         char prev = world[r][c];
         world[r][c] = proj;
-        draw_world(world);
+        draw_world_with_hud(world, player_hp_global);
 
         // Damage any enemy at this position
         apply_damage_at(world, r, c, dmg);
@@ -355,7 +392,7 @@ void gun_attack(char world[ROWS][COLS+1], int pr, int pc, char last_dir, int dmg
 
         char prev = world[r][c];
         world[r][c] = proj;
-        draw_world(world);
+        draw_world_with_hud(world, player_hp_global);
 
         // Damage any enemy at this position
         apply_damage_at(world, r, c, dmg);
@@ -388,7 +425,7 @@ void can_attack(char world[ROWS][COLS+1], int pr, int pc, char last_dir, int dmg
 
         char prev = world[r][c];
         world[r][c] = proj;
-        draw_world(world);
+        draw_world_with_hud(world, player_hp_global);
 
         // Damage any enemy at this position
         apply_damage_at(world, r, c, dmg);
@@ -404,11 +441,6 @@ void can_attack(char world[ROWS][COLS+1], int pr, int pc, char last_dir, int dmg
         }
     }
 }
-
-
-
-
-
 
 // ---------- Enemies ----------
 // Create enemy with randomized stats/shapes based on type
@@ -465,7 +497,7 @@ void update_enemy_ai(Enemy *e, char world[ROWS][COLS+1], int pr, int pc) {
     // do not attempt to move when player is too far
     int dist = abs(e->row - pr) + abs(e->col - pc);
     if (!e->aggro && dist > DETECTION_RANGE) {
-        e->last_move = t; 
+        e->last_move = t;
         return; // not aggro yet, ignore player
     }
 
@@ -556,7 +588,7 @@ int enemy_try_attack(Enemy *e, int pr, int pc, int *player_hp, char world[ROWS][
     // If enough time passed since contact_time, apply damage and show attack flash
     if ((t - e->contact_time) >= enemy_hit_delay(e)) {
         // apply damage
-        *player_hp -= e->dmg;
+        *player_hp -= (e->dmg)*2; //Double damage - change '2' to adjust the amount of base damage
         // set attack-state flash
         e->attack_state = 2; // 'X'
         e->attack_state_until = t + enemy_attack_flash_time(e);
@@ -573,6 +605,7 @@ int enemy_try_attack(Enemy *e, int pr, int pc, int *player_hp, char world[ROWS][
 
 // ---------- MAIN ----------
 int main(void) {
+
     srand((unsigned)time(NULL));
 
     // ---------- Map (ASCII art intact) ----------
@@ -605,6 +638,7 @@ int main(void) {
 
     // ASCII banner
     printf(
+        BYELLOW
         "\n\n"
         " █████   █████                    █████            \n"
         "░░███   ░░███                    ░░███             \n"
@@ -617,18 +651,19 @@ int main(void) {
         "                       By Mobin                    \n\n\n\n"
     );
 
-    printf("- Type any key to start -");
+    printf(GREY "- Type any key to start -");
     getchar();
     system("clear");
 
     // Class selection loop
     do {
         printf(
-            "Choose your class:\n"
-            "\t1) Cannoneer   - Heavy melee class\n"
+            BOLD GREEN"Choose your class:\n"
+            NORMAL BGREEN"\t1) Cannoneer   - Heavy melee class\n"
             "\t2) Gunslinger  - Light melee class\n"
             "\t3) Sorcerer - Mage class\n\n"
-            "Write class number to select: "
+
+            GREY "Write class number to select: "
         );
         scanf(" %c", &u_input);
         switch (u_input) {
@@ -637,15 +672,15 @@ int main(void) {
             case '3': strcpy(player_class,"Sorcerer"); player_stats=(Stats){10, 6,15,20, 8};mods = (ClassModifiers){1.0, 1.2, 1.2}; /*balanced, mid damage*/; break;
             default:  player_class[0]='\0';
         }
-        if (!player_class[0]) puts("\nInvalid choice, please try again!\n");
+        if (!player_class[0]) puts(RED BOLD"\nInvalid choice, please try again!\n"NORMAL);
     } while (!player_class[0]);
 
     // Show chosen class & stats
-    printf("\nYou have chosen: %s\n\n", player_class);
-    printf("Your stats:\nVGR: %d | STR: %d | SPD: %d | INT: %d | LCK: %d\n",
+    printf(BOLD GREEN "\nYou have chosen: %s\n\n" NORMAL, player_class);
+    printf(NORMAL BGREEN"Your stats:\nVGR: %d | STR: %d | SPD: %d | INT: %d | LCK: %d\n",
            player_stats.VGR, player_stats.STR, player_stats.SPD,
            player_stats.INT, player_stats.LCK);
-    printf("\n- Type any key to Continue -");
+    printf(NORMAL GREY"\n- Type any key to Continue -");
     scanf(" %c", &u_input);
     system("clear");
 
@@ -654,7 +689,7 @@ int main(void) {
     if (!find_player(world, &pr, &pc)) { fprintf(stderr, "No 'P' on the map!\n"); return 1; }
 
     // ---- Player HP ----
-    int player_hp = 30 + player_stats.VGR * 2;
+    player_hp_global = 30 + player_stats.VGR * 2;
 
     // ---- Spawn enemies (luck affects difficulty) ----
     int base_enemies = 8;
@@ -678,7 +713,7 @@ int main(void) {
     // ---- Game loop ----
     while (1) {
         // Draw frame with HUD
-        draw_world_with_hud(world, player_hp);
+        draw_world_with_hud(world, player_hp_global);
 
         // ENEMY PHASE
         for (int i = 0; i < enemy_count; i++) {
@@ -686,8 +721,8 @@ int main(void) {
             if (!e->alive) continue;
 
             // Try to attack if touching player (attack logic delays the first hit and shows visuals)
-            enemy_try_attack(e, pr, pc, &player_hp, world);
-            if (player_hp <= 0) { system("clear"); puts("YOU DIED!"); return 0; }
+            enemy_try_attack(e, pr, pc, &player_hp_global, world);
+            if (player_hp_global <= 0) { system("clear"); puts("YOU DIED!"); return 0; }
 
             // Move toward player (BFS pathfinding + fallback greedy)
             update_enemy_ai(e, world, pr, pc);
@@ -700,8 +735,8 @@ int main(void) {
         // PLAYER PHASE: handle cooldown & input
         if (action_locked) {
             while (kbhit()) (void)getchar(); // drain buffer
-            int delay = (cooldown_type == 1) ? 
-              movement_delay(player_stats, mods.move_speed_mult) : 
+            int delay = (cooldown_type == 1) ?
+              movement_delay(player_stats, mods.move_speed_mult) :
               attack_delay(player_stats, mods.atk_speed_mult);
             if ((now_us() - last_action) > delay) action_locked = 0;
             usleep(50000);
@@ -749,6 +784,6 @@ int main(void) {
     }
 
     system("clear");
-    printf("Goodbye, %s.\n", player_class);
+    printf(BRED "Goodbye, %s.\n", player_class);
     return 0;
 }
