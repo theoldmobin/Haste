@@ -1,14 +1,10 @@
 // "HASTE"
-
+//
 // ASCII-ART TEXT-BASED ADVENTURE RPG GAME
 // BY MOBIN - 2025
-
-// Fixed: 
-//  - attack rendering no longer flashes whole screen grey (uses draw_world_with_hud)
-//  - projectiles/bullets are colored yellow
 //
-// NOTE: sound code is still commented out as in the user-supplied source.
-//       If you want terminal beeps you can install `beep` and enable sound calls.
+// Extended by assistant: boss 360° burst, staggered bullets, safer boss damage,
+// boss teleport validation, XP drops, tuning defines.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,11 +13,11 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
-#include <pthread.h> // multi threading (left included as in original)
+#include <math.h>
 
 #define ROWS 20
 #define COLS 40
-#define MAX_ENEMIES 32
+#define MAX_ENEMIES 26
 #define DETECTION_RANGE 9   /* how far enemies will try to pathfind */
 
 #define NORMAL "\033[0m"
@@ -41,31 +37,68 @@
 #define BYELLOW "\033[93m"
 #define BBLUE   "\033[94m"
 
+// Small helper color aliases used in UI
+#define LGREEN GREEN
+#define LYELLOW YELLOW
+#define LRED RED
+
 #define CLR()   printf("\033[H")     // cursor to home
 #define CLS()   printf("\033[2J\033[H") // clear once at start
 
-// ---------- (Optional) Soundtrack (commented in original) ----------
-/*
-void play_note(int freq, int duration_ms) {
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "beep -f %d -l %d >/dev/null 2>&1", freq, duration_ms);
-    system(cmd);
-}
-void* soundtrack(void* arg) {
-    while (1) {
-        play_note(440, 200);
-        usleep(300000);
-        play_note(523, 200);
-        usleep(300000);
-    }
-    return NULL;
-}
-*/
+// ------------------ TUNING / DEFINES ------------------
+// Change these to tune boss & bullet behaviour
 
-// ---------- Globals ----------
+// Boss teleport points (row,col) - edit to set your 4 coordinates
+#define BOSS_TP_R0 2
+#define BOSS_TP_C0 30
+#define BOSS_TP_R1 4
+#define BOSS_TP_C1 7
+#define BOSS_TP_R2 16
+#define BOSS_TP_C2 30
+#define BOSS_TP_R3 17
+#define BOSS_TP_C3 7
+
+// Teleport timing (microseconds)
+#define BOSS_TELEPORT_BASE_DELAY_US 7000000  /* base wait between sequences (7s) */
+#define BOSS_TELEPORT_VARIANCE_US   2000000  /* random variance added (0..2s) */
+
+// Shots per sequence (waves)
+#define BOSS_SHOT_WAVES_MIN 3
+#define BOSS_SHOT_WAVES_MAX 7
+
+// Shots per wave (360 resolution) - number of directions (e.g. 8 or 16)
+#define BOSS_SHOT_DIRECTIONS 32
+
+// Stagger between bullets (microseconds) - small delay between each bullet in burst
+#define BOSS_SHOT_STAGGER_US 85000  /* 85ms between bullets -> visual spread */
+
+// Bullet tuning
+#define BOSS_BULLET_BASE_SPEED 1.5    /* higher -> move more frequently */
+#define BOSS_BULLET_LIFETIME 40     /* moves before disappearing */
+#define BOSS_BULLET_DAMAGE_DIV   2  /* boss->dmg divided by this to avoid one-shot */
+
+// XP drop ranges
+#define XP_NORMAL_MIN 10
+#define XP_NORMAL_MAX 20
+#define XP_ELITE_MIN 50
+#define XP_ELITE_MAX 80
+#define XP_BOSS_MIN 250
+#define XP_BOSS_MAX 350
+
+// -------------------------------------------------------
+
+ // ---------- Globals ----------
 static int player_hp_global = 0; // made global so attack functions can call draw_world_with_hud
 static int current_level = 1;    // current level (1..3)
-static int player_xp = 0;        // placeholder for future xp/upgrade system
+static int player_xp = 0;        // XP currency for upgrades
+static int player_total_xp = 0;  // cumulative XP
+
+// ---------- Timing helpers (monotonic) ----------
+static inline long now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
+}
 
 // ---------- Stats ----------
 typedef struct {
@@ -84,29 +117,28 @@ ClassModifiers mods;
 // ---------- Enemies ----------
 typedef struct {
     int hp;
+    int max_hp;
     int dmg;
     int speed;         // how often they move (higher = faster)
     int row, col;      // top-left cell
-    char shape[4];     // allow up to 3 chars + null (boss "{N}")
+    char shape[4];     // single char + '\0' for normal/elite, boss 'N'
     int is_elite;
     int is_boss;
     long last_move;    // µs timestamp for movement cooldown
-    long last_hit;     // µs timestamp for last damage tick against player (unused now)
-    long contact_time; // µs timestamp when first touched player (used to delay first hit & repeat)
-    long attack_state_until; // µs when attack visual state should revert
-    int attack_state;  // 0=idle,1=windup('x'),2=attack('X')
+    long last_hit;
+    long contact_time;
+    long attack_state_until;
+    int attack_state;
     int alive;
-    int width;         // strlen(shape)
+    int width;
 
-    int aggro;   // whether enemy has spotted the player
+    int aggro;
+
+    // boss fields
+    long boss_next_action;
+    int boss_phase;
+    int boss_shot_seq;
 } Enemy;
-
-int calc_damage(const char *cls, Stats s, ClassModifiers m) {
-    int base = 0;
-    if (strcmp(cls,"Sorcerer")==0) base = 3 + s.INT / 4;
-    else base = 3 + s.STR / 4;
-    return (int)(base * m.dmg_mult);
-}
 
 static Enemy enemies[MAX_ENEMIES];
 static int enemy_count = 0;
@@ -114,26 +146,52 @@ static int enemy_count = 0;
 // Player facing direction (last WASD pressed)
 static char last_dir = 'd';
 
-// ---------- Timing helpers (monotonic) ----------
-static inline long now_us(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
+// ---------- Bullets (boss projectiles) ----------
+#define MAX_BULLETS 256
+typedef struct {
+    int alive;
+    int row, col;
+    int dr, dc;          // direction (-1,0,1)
+    int damage;
+    int speed;           // higher = moves more often
+    long last_move;      // µs timestamp used for move cadence and start delay
+    int lifetime;        // in moves remaining
+    long homing_until;   // µs until which homing is active (0=no homing)
+    char char_repr;      // ASCII char for drawing
+} Bullet;
+static Bullet bullets[MAX_BULLETS];
+
+// ---------- Utility prototypes ----------
+int kbhit(void);
+void draw_world_with_hud(char world[ROWS][COLS+1], int hp);
+int find_player(char world[ROWS][COLS+1], int *pr, int *pc);
+int find_enemy_at(int r, int c);
+void apply_damage_at(char world[ROWS][COLS+1], int r, int c, int dmg);
+int find_next_step_bfs(char world[ROWS][COLS+1], const Enemy *e, int pr, int pc, int *out_r, int *out_c);
+void place_enemy_on_world(char world[ROWS][COLS+1], const Enemy *e);
+void remove_enemy_from_world(char world[ROWS][COLS+1], const Enemy *e);
+
+// spawn bullet: added start_delay_us param to stagger visuals
+int spawn_bullet(int r, int c, int dr, int dc, int damage, int speed, int lifetime, long start_delay_us, long homing_until_us, char repr);
+
+// ---------- Simple damage calc ----------
+int calc_damage(const char *cls, Stats s, ClassModifiers m) {
+    int base = 0;
+    if (strcmp(cls,"Sorcerer")==0) base = 3 + s.INT / 4;
+    else base = 3 + s.STR / 4;
+    return (int)(base * m.dmg_mult);
 }
 
-// Convert SPD into movement/attack delays (player) in microseconds
+// ---------- Timing helpers continued ----------
 int movement_delay(Stats s, float mult) {
     return (int)(20000 / (s.SPD > 0 ? s.SPD : 1) / mult);
 }
-
 int attack_delay(Stats s, float mult) {
     return (int)(10000 / (s.SPD > 0 ? s.SPD : 1) / mult);
 }
-
-// Enemy timing (in µs). Tuned to ~0.8s - 2s range:
 int enemy_move_delay(const Enemy *e) { return 1500000 / (e->speed > 0 ? e->speed : 1); }
-int enemy_hit_delay (const Enemy *e) { return 500000; } // 0.5s between enemy hits
-int enemy_attack_flash_time(const Enemy *e) { return 200000; } // 0.2s attack flash
+int enemy_hit_delay (const Enemy *e) { return 700000; }
+int enemy_attack_flash_time(const Enemy *e) { return 230000; }
 
 // ---------- Realtime input (Linux) ----------
 int kbhit(void) {
@@ -160,8 +218,6 @@ int kbhit(void) {
 }
 
 // ---------- World helpers ----------
-
-// helper: fill world array with '#' walls
 void fill_world_with_walls(char world[ROWS][COLS+1]) {
     for (int r = 0; r < ROWS; r++) {
         for (int c = 0; c < COLS; c++) world[r][c] = '#';
@@ -169,60 +225,46 @@ void fill_world_with_walls(char world[ROWS][COLS+1]) {
     }
 }
 
-// random-room map generator: places several rectangular rooms and connects them with corridors.
+// Map generator (same as earlier)
 void generate_map(char world[ROWS][COLS+1], int *out_pr, int *out_pc) {
     fill_world_with_walls(world);
 
-    // Simple list of room centers to connect
     int room_centers[8][2];
     int room_count = 0;
     int max_rooms = 6;
 
     for (int r = 0; r < ROWS; ++r) for (int c = 0; c < COLS; ++c) world[r][c] = '#';
 
-    // Create a few rooms
     for (int i = 0; i < max_rooms; ++i) {
         int rw = 4 + rand()%8;  // width
         int rh = 3 + rand()%4;  // height
         int rx = 1 + rand() % (COLS - rw - 2);
         int ry = 1 + rand() % (ROWS - rh - 2);
 
-        // Carve room
-        for (int y = ry; y < ry + rh; ++y) {
-            for (int x = rx; x < rx + rw; ++x) {
+        for (int y = ry; y < ry + rh; ++y)
+            for (int x = rx; x < rx + rw; ++x)
                 world[y][x] = ' ';
-            }
-        }
-        // record center
+
         room_centers[room_count][0] = ry + rh/2;
         room_centers[room_count][1] = rx + rw/2;
         room_count++;
     }
 
-    // Connect rooms with straight corridors (L-shaped)
     for (int i = 1; i < room_count; ++i) {
         int y1 = room_centers[i-1][0], x1 = room_centers[i-1][1];
         int y2 = room_centers[i][0], x2 = room_centers[i][1];
 
         int cx = x1;
-        while (cx != x2) {
-            world[y1][cx] = ' ';
-            if (x2 > cx) cx++; else cx--;
-        }
+        while (cx != x2) { world[y1][cx] = ' '; if (x2 > cx) cx++; else cx--; }
         int cy = y1;
-        while (cy != y2) {
-            world[cy][x2] = ' ';
-            if (y2 > cy) cy++; else cy--;
-        }
+        while (cy != y2) { world[cy][x2] = ' '; if (y2 > cy) cy++; else cy--; }
     }
 
-    // Place player in first room center
     if (room_count > 0) {
         int pr = room_centers[0][0], pc = room_centers[0][1];
         world[pr][pc] = 'P';
         *out_pr = pr; *out_pc = pc;
     } else {
-        // fallback: center of map
         int pr = ROWS/2, pc = COLS/2;
         world[pr][pc] = 'P';
         *out_pr = pr; *out_pc = pc;
@@ -234,48 +276,69 @@ void draw_world(char world[ROWS][COLS+1]) {
     for (int r = 0; r < ROWS; r++) puts(world[r]);
 }
 
-// Draw frame with HUD and colors. Projectiles/bullets are printed in YELLOW.
+// Helper: find boss index
+int find_boss_index(void) {
+    for (int i = 0; i < enemy_count; ++i) if (enemies[i].alive && enemies[i].is_boss) return i;
+    return -1;
+}
+
+// Render world + HUD + overlay bullets (boss projectiles).
 void draw_world_with_hud(char world[ROWS][COLS+1], int hp) {
     CLR();
-    for (int r = 0; r < ROWS; r++) {
-        for (int c = 0; c < COLS; c++) {
+    int boss_idx = find_boss_index();
+    long tnow = now_us();
+    for (int r = 0; r < ROWS; ++r) {
+        for (int c = 0; c < COLS; ++c) {
+            // If a bullet occupies this tile, render it (bullets drawn above everything)
+            int bullet_here = 0;
+            for (int b = 0; b < MAX_BULLETS; ++b) {
+                if (bullets[b].alive) {
+                    // hide bullets until their start time, so delayed spawns don't sit & draw at old positions
+                    if (tnow < bullets[b].last_move) continue;
+                    if (bullets[b].row == r && bullets[b].col == c) {
+                        printf(YELLOW "%c" RESET, bullets[b].char_repr);
+                        bullet_here = 1;
+                        break;
+                    }
+                }
+            }
+            if (bullet_here) continue;
+
             char tile = world[r][c];
-            // projectile / attack symbols -> YELLOW
+            // projectile / attack symbols from player -> YELLOW (player projectiles are written into world)
             if (tile == '^' || tile == 'v' || tile == '<' || tile == '>' ||
                 tile == '|' || tile == '-' || tile == '*' || tile == '0') {
                 printf(YELLOW "%c" RESET, tile);
-            }
-            else if (tile == 'P') {
-                printf(BOLD BBLUE "P" RESET NORMAL); // player lblue
-            } else if (tile == 'M' || tile == 'Z' || tile == 'X' || tile == 'Y') {
-                printf(BRED "%c" RESET, tile);  // normal enemies l red
-            } else if (tile == 'E') {
-                printf(RED "E" RESET);    // elite
-            } else if (tile == '{' || tile == '}' || tile == 'N') {
-                // Boss shows as YELLOW for any of its characters
-                printf(BOLD YELLOW "%c" RESET NORMAL, tile);
-            } else if (tile == 'B') {
-                printf(MAGENTA "B" RESET);   // previous boss char (kept for compatibility)
+            } else if (tile == 'P') {
+                printf(BOLD BBLUE "P" RESET NORMAL);
+            } else if (tile >= 'a' && tile <= 'z') { // normal enemy
+                printf(BRED "%c" RESET, tile);
+            } else if (tile >= 'A' && tile <= 'Z' && tile != 'P') { // elite or boss letter
+                printf(MAGENTA "%c" RESET, tile);
             } else if (tile == '#') {
-                printf(GREY "#" RESET);          // walls grey
+                printf(GREY "#" RESET);
             } else {
                 printf("%c", tile);
             }
         }
-        if (r == 0) printf(BOLD RED "   ♡ HP: %d" RESET, hp);
+        if (r == 0) {
+            printf(BOLD RED "   ♡ HP: %d" RESET, hp);
+            printf("  " BOLD BYELLOW "❇️ XP: %d" RESET, player_xp);
+            if (boss_idx != -1) {
+                int bhp = enemies[boss_idx].hp;
+                printf("  " BOLD MAGENTA "✴️ Boss HP: %d/%d" RESET, bhp, enemies[boss_idx].max_hp);
+            }
+        }
         printf("\n");
     }
 }
 
-// Find player on the map
+// ---------- Find / placement helpers ----------
 int find_player(char world[ROWS][COLS+1], int *pr, int *pc) {
-    for (int r = 0; r < ROWS; r++)
-        for (int c = 0; c < COLS; c++)
-            if (world[r][c] == 'P') { *pr = r; *pc = c; return 1; }
+    for (int r = 0; r < ROWS; r++) for (int c = 0; c < COLS; c++) if (world[r][c] == 'P') { *pr = r; *pc = c; return 1; }
     return 0;
 }
 
-// Check if a horizontal run width 'w' at (r,c) is empty (no walls / enemies)
 int is_empty_run(char world[ROWS][COLS+1], int r, int c, int w) {
     if (r < 0 || r >= ROWS) return 0;
     if (c < 0 || (c + w - 1) >= COLS) return 0;
@@ -283,29 +346,36 @@ int is_empty_run(char world[ROWS][COLS+1], int r, int c, int w) {
     return 1;
 }
 
-// Place or remove enemy characters on the world grid (safe bounds-checked).
-// Placement respects the enemy->attack_state: if windup show 'x', if attack show 'X'.
+int is_traversable_for_pathfinding(char world[ROWS][COLS+1], int r, int c, int w) {
+    if (r < 0 || r >= ROWS) return 0;
+    if (c < 0 || (c + w - 1) >= COLS) return 0;
+    for (int i = 0; i < w; i++) if (world[r][c+i] == '#') return 0;
+    return 1;
+}
+
 void place_enemy_on_world(char world[ROWS][COLS+1], const Enemy *e) {
     if (!e->alive) return;
-    for (int i = 0; i < e->width; i++) {
+    for (int i = 0; i < e->width; ++i) {
         int cc = e->col + i;
         if (e->row >= 0 && e->row < ROWS && cc >= 0 && cc < COLS) {
             char ch = e->shape[i];
-            if (e->attack_state == 1) ch = 'x';
-            else if (e->attack_state == 2) ch = 'X';
+            // keep boss glyph stable; don't swap to x/X for boss
+            if (!e->is_boss) {
+                if (e->attack_state == 1) ch = 'x';
+                else if (e->attack_state == 2) ch = 'X';
+            }
             world[e->row][cc] = ch;
         }
     }
 }
 void remove_enemy_from_world(char world[ROWS][COLS+1], const Enemy *e) {
-    for (int i = 0; i < e->width; i++) {
+    for (int i = 0; i < e->width; ++i) {
         int cc = e->col + i;
         if (e->row >= 0 && e->row < ROWS && cc >= 0 && cc < COLS)
             if (world[e->row][cc] != '#') world[e->row][cc] = ' ';
     }
 }
 
-// ---------- Enemy helpers ----------
 // Return index of enemy occupying (r,c) or -1 if none
 int find_enemy_at(int r, int c) {
     for (int i = 0; i < enemy_count; i++) {
@@ -316,31 +386,38 @@ int find_enemy_at(int r, int c) {
     return -1;
 }
 
-// Apply damage to enemy at (r,c). If it dies, remove it from the world.
+// Apply damage to enemy at (r,c). If it dies, remove it and award XP.
 void apply_damage_at(char world[ROWS][COLS+1], int r, int c, int dmg) {
     int idx = find_enemy_at(r, c);
     if (idx < 0) return;
     enemies[idx].hp -= dmg;
+
     if (enemies[idx].hp <= 0) {
+        int xp_gain = 0;
+        if (enemies[idx].is_boss) {
+            xp_gain = XP_BOSS_MIN + (rand() % (XP_BOSS_MAX - XP_BOSS_MIN + 1));
+        } else if (enemies[idx].is_elite) {
+            xp_gain = XP_ELITE_MIN + (rand() % (XP_ELITE_MAX - XP_ELITE_MIN + 1));
+        } else {
+            xp_gain = XP_NORMAL_MIN + (rand() % (XP_NORMAL_MAX - XP_NORMAL_MIN + 1));
+        }
+        player_xp += xp_gain;
+        player_total_xp += xp_gain;
+
         enemies[idx].alive = 0;
         remove_enemy_from_world(world, &enemies[idx]);
     } else {
-        // refresh world char(s) so damage flash will show correctly
         remove_enemy_from_world(world, &enemies[idx]);
         place_enemy_on_world(world, &enemies[idx]);
     }
 }
 
-/* ---------- Pathfinding (BFS) ----------
-   Find shortest path from (sr,sc) to ANY cell adjacent to player (pr,pc).
-   Limits BFS depth to DETECTION_RANGE to avoid searching whole map.
-   Returns 1 and writes the first step into *out_r,*out_c.
-   Returns 0 if no path found or player too far.
-*/
+// ---------- Pathfinding (BFS) ----------
 int find_next_step_bfs(char world[ROWS][COLS+1], const Enemy *e, int pr, int pc, int *out_r, int *out_c) {
     int sr = e->row, sc = e->col;
     int manh = abs(sr - pr) + abs(sc - pc);
-    if (manh > DETECTION_RANGE) return 0; /* too far, don't BFS */
+    if (manh > DETECTION_RANGE && !e->is_boss && !e->is_elite) return 0; /* small enemies may be less eager */
+    if (e->is_elite && manh > DETECTION_RANGE*2) return 0;
 
     int total = ROWS * COLS;
     int q_r[ROWS*COLS], q_c[ROWS*COLS];
@@ -360,12 +437,10 @@ int find_next_step_bfs(char world[ROWS][COLS+1], const Enemy *e, int pr, int pc,
     while (head < tail) {
         int r = q_r[head], c = q_c[head]; head++;
         int d = depth[r * COLS + c];
-        if (d > DETECTION_RANGE) continue; /* depth exceeded */
+        if (d > DETECTION_RANGE*2 && !e->is_boss) continue;
 
-        /* If cell adjacent to player, it's a goal */
         if (abs(r - pr) + abs(c - pc) <= 1) { goal_r = r; goal_c = c; break; }
 
-        /* Explore 4 neighbors */
         const int dr[4] = {-1,1,0,0};
         const int dc[4] = {0,0,-1,1};
         for (int k = 0; k < 4; k++) {
@@ -373,7 +448,6 @@ int find_next_step_bfs(char world[ROWS][COLS+1], const Enemy *e, int pr, int pc,
             if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) continue;
             if (seen[nr][nc]) continue;
 
-            /* allow stepping into player's cell only if width==1 (fallback) */
             if (nr == pr && nc == pc) {
                 if (e->width == 1) {
                     seen[nr][nc] = 1;
@@ -384,8 +458,7 @@ int find_next_step_bfs(char world[ROWS][COLS+1], const Enemy *e, int pr, int pc,
                 continue;
             }
 
-            /* require the horizontal run (width) to be free for placement */
-            if (!is_empty_run(world, nr, nc, e->width)) continue;
+            if (!is_traversable_for_pathfinding(world, nr, nc, e->width)) continue;
 
             seen[nr][nc] = 1;
             parent[nr * COLS + nc] = r * COLS + c;
@@ -394,12 +467,10 @@ int find_next_step_bfs(char world[ROWS][COLS+1], const Enemy *e, int pr, int pc,
         }
     }
 
-    if (goal_r == -1) return 0; /* no reachable adjacent cell */
+    if (goal_r == -1) return 0;
 
-    /* Reconstruct path: walk parent links from goal back to start */
     int cur_idx = goal_r * COLS + goal_c;
     int start_idx = sr * COLS + sc;
-
     if (cur_idx == start_idx) { *out_r = sr; *out_c = sc; return 0; }
 
     int prev = parent[cur_idx];
@@ -414,11 +485,7 @@ int find_next_step_bfs(char world[ROWS][COLS+1], const Enemy *e, int pr, int pc,
     return 1;
 }
 
-// ---------- Player attacks ----------
-// NOTE: these functions now call draw_world_with_hud(..., player_hp_global)
-// so we can keep colors during attack animations.
-
-// Mage projectile: travels, damages enemies, stops on first hit
+// ---------- Player attacks (unchanged except they render using draw_world_with_hud) ----------
 void mage_attack(char world[ROWS][COLS+1], int pr, int pc, char last_dir, int dmg) {
     int dr = 0, dc = 0; char proj = '?';
     if (last_dir == 'w') { dr = -1; proj = '|'; }
@@ -432,32 +499,28 @@ void mage_attack(char world[ROWS][COLS+1], int pr, int pc, char last_dir, int dm
         if (r < 0 || r >= ROWS || c < 0 || c >= COLS) break;
         if (world[r][c] == '#') break;
 
+        // no per-step redraw/sleep to avoid frame hitch during boss spam
         char prev = world[r][c];
         world[r][c] = proj;
-        draw_world_with_hud(world, player_hp_global);
 
-        // Damage any enemy at this position
         apply_damage_at(world, r, c, dmg);
-        usleep(80000);
 
-        // If an enemy still occupies the cell after damage, restore its char and stop
         int idx = find_enemy_at(r, c);
         if (idx >= 0 && enemies[idx].alive) {
             world[r][c] = enemies[idx].shape[c - enemies[idx].col];
             break;
         } else {
-            world[r][c] = ' ';
+            world[r][c] = prev == ' ' ? ' ' : prev;
         }
     }
 }
 
-// Gun projectile: travels, damages enemies, stops on first hit
 void gun_attack(char world[ROWS][COLS+1], int pr, int pc, char last_dir, int dmg) {
-    int dr = 0, dc = 0; char proj = '?';
-    if (last_dir == 'w') { dr = -1; proj = '*'; }
-    else if (last_dir == 's') { dr =  1; proj = '*'; }
-    else if (last_dir == 'a') { dc = -1; proj = '*'; }
-    else if (last_dir == 'd') { dc =  1; proj = '*'; }
+    int dr = 0, dc = 0; char proj = '*';
+    if (last_dir == 'w') { dr = -1; }
+    else if (last_dir == 's') { dr =  1; }
+    else if (last_dir == 'a') { dc = -1; }
+    else if (last_dir == 'd') { dc =  1; }
 
     int r = pr, c = pc;
     for (int step = 0; step < 6; step++) {
@@ -467,30 +530,25 @@ void gun_attack(char world[ROWS][COLS+1], int pr, int pc, char last_dir, int dmg
 
         char prev = world[r][c];
         world[r][c] = proj;
-        draw_world_with_hud(world, player_hp_global);
 
-        // Damage any enemy at this position
         apply_damage_at(world, r, c, dmg);
-        usleep(80000);
 
-        // If an enemy still occupies the cell after damage, restore its char and stop
         int idx = find_enemy_at(r, c);
         if (idx >= 0 && enemies[idx].alive) {
             world[r][c] = enemies[idx].shape[c - enemies[idx].col];
             break;
         } else {
-            world[r][c] = ' ';
+            world[r][c] = prev == ' ' ? ' ' : prev;
         }
     }
 }
 
-// Cannon projectile: travels, damages enemies, stops on first hit
 void can_attack(char world[ROWS][COLS+1], int pr, int pc, char last_dir, int dmg) {
-    int dr = 0, dc = 0; char proj = '?';
-    if (last_dir == 'w') { dr = -1; proj = '0'; }
-    else if (last_dir == 's') { dr =  1; proj = '0'; }
-    else if (last_dir == 'a') { dc = -1; proj = '0'; }
-    else if (last_dir == 'd') { dc =  1; proj = '0'; }
+    int dr = 0, dc = 0; char proj = '0';
+    if (last_dir == 'w') { dr = -1; }
+    else if (last_dir == 's') { dr =  1; }
+    else if (last_dir == 'a') { dc = -1; }
+    else if (last_dir == 'd') { dc =  1; }
 
     int r = pr, c = pc;
     for (int step = 0; step < 6; step++) {
@@ -500,107 +558,93 @@ void can_attack(char world[ROWS][COLS+1], int pr, int pc, char last_dir, int dmg
 
         char prev = world[r][c];
         world[r][c] = proj;
-        draw_world_with_hud(world, player_hp_global);
 
-        // Damage any enemy at this position
         apply_damage_at(world, r, c, dmg);
-        usleep(80000);
 
-        // If an enemy still occupies the cell after damage, restore its char and stop
         int idx = find_enemy_at(r, c);
         if (idx >= 0 && enemies[idx].alive) {
             world[r][c] = enemies[idx].shape[c - enemies[idx].col];
             break;
         } else {
-            world[r][c] = ' ';
+            world[r][c] = prev == ' ' ? ' ' : prev;
         }
     }
 }
 
-// ---------- Enemies ----------
-// Create enemy with randomized stats/shapes based on type
+// ---------- Enemy spawning: new character system (a..z normals, A..Z elites). ----------
 Enemy spawn_enemy(char world[ROWS][COLS+1], int is_elite, int is_boss, int pr, int pc) {
     Enemy e = {0};
     e.is_elite = is_elite;
     e.is_boss  = is_boss;
     e.alive    = 1;
-    e.last_move = e.last_hit = e.contact_time = e.attack_state_until = 0;
+    e.last_move = e.last_hit = e.contact_time = e.attack_state_until = e.boss_next_action = 0;
     e.attack_state = 0;
+    e.aggro = 0;
+    e.boss_phase = 1;
 
     if (is_boss) {
-        e.hp = 60 + current_level * 10;
-        e.dmg = 10 + current_level * 2;
-        e.speed = 5;
-        strcpy(e.shape, "{N}");
-    } else if (is_elite) {
-        e.hp = 20 + rand()%15 + current_level * 2;
-        e.dmg = 5 + rand()%3 + current_level;
-        e.speed = 3 + rand()%2;
-        strcpy(e.shape, "EE");   // two-char elite
+        e.max_hp = e.hp = 220 + current_level * 80;
+        e.dmg = 12 + current_level * 4;
+        e.speed = 3;
+        strcpy(e.shape, "N"); // boss visual 'N' (distinct)
     } else {
-        e.hp = 8 + rand()%8 + current_level;
-        e.dmg = 2 + rand()%2 + (current_level>1 ? 1 : 0);
-        e.speed = 2 + rand()%3;
-        e.shape[0] = "MZXY"[rand()%4]; e.shape[1] = '\0';
+        // Strength rank 0..25
+        int rank_base = (current_level - 1) * 6; // level scales
+        if (!is_elite) {
+            int rank = rank_base + rand()%6; if (rank < 0) rank = 0; if (rank > 25) rank = 25;
+            e.max_hp = e.hp = 5 + rank*2 + current_level; // HP grows with rank
+            e.dmg = 1 + rank/6 + current_level/2;
+            e.speed = 2 + (rank/10) + (rand()%2);
+            char ch = 'a' + rank;
+            e.shape[0] = ch; e.shape[1] = '\0';
+        } else {
+            int rank = rank_base + 3 + rand()%6; if (rank < 0) rank = 0; if (rank > 25) rank = 25;
+            e.max_hp = e.hp = 18 + rank*3 + current_level*2;
+            e.dmg = 4 + rank/4 + current_level;
+            e.speed = 3 + (rank/12);
+            char ch = 'A' + rank;
+            e.shape[0] = ch; e.shape[1] = '\0';
+            e.is_elite = 1;
+        }
     }
     e.width = (int)strlen(e.shape);
 
-    // Place enemy away from player on empty run
+    // Place enemy away from player
     int tries = 400;
     do {
         e.row = rand() % ROWS;
         e.col = rand() % (COLS - e.width);
     } while (--tries &&
              (!is_empty_run(world, e.row, e.col, e.width) ||
-              (abs(e.row - pr) + abs(e.col - pc) < 4))); // closer threshold slightly reduced for density
-
-    if (!tries) e.alive = 0; // placement failed
+              (abs(e.row - pr) + abs(e.col - pc) < 4)));
+    if (!tries) e.alive = 0;
     return e;
 }
 
-// Update enemy AI: uses BFS to find path to nearest cell adjacent to the player
+// ---------- Enemy AI ----------
 void update_enemy_ai(Enemy *e, char world[ROWS][COLS+1], int pr, int pc) {
     if (!e->alive) return;
     long t = now_us();
 
-    /* Move only when movement cooldown elapsed */
+    if (e->is_boss) return;
+
     if ((t - e->last_move) < enemy_move_delay(e)) return;
 
-    /* If already adjacent to player, don't try to move (attack handled elsewhere) */
     if (abs(e->row - pr) + abs(e->col - pc) <= 1) {
         e->last_move = t;
         return;
     }
 
-    // do not attempt to move when player is too far
     int dist = abs(e->row - pr) + abs(e->col - pc);
-    if (!e->aggro && dist > DETECTION_RANGE) {
+    int effective_detection = DETECTION_RANGE;
+    if (e->is_elite) effective_detection = DETECTION_RANGE * 2;
+    if (!e->is_elite && !e->aggro && dist > effective_detection) {
         e->last_move = t;
-        return; // not aggro yet, ignore player
+        return;
     }
 
-    // If in range once, set aggro
-    if (dist <= DETECTION_RANGE) {
-        e->aggro = 1;
-    }
+    if (dist <= effective_detection || e->is_elite) e->aggro = 1;
 
-    /* Small random wiggle for elites so they look 'strange' but not broken */
-    if (e->is_elite && (rand() % 4) == 0) {
-        /* try a random adjacent step (if empty) */
-        const int drs[4] = {-1,1,0,0}, dcs[4] = {0,0,-1,1};
-        int k = rand() % 4;
-        int rr = e->row + drs[k], rc = e->col + dcs[k];
-        if (is_empty_run(world, rr, rc, e->width)) {
-            remove_enemy_from_world(world, e);
-            e->row = rr; e->col = rc;
-            place_enemy_on_world(world, e);
-            e->last_move = t;
-            return;
-        }
-        /* if random step blocked, fall through to normal pathing */
-    }
-
-    /* Prefer BFS pathfinding if player near */
     int nr, nc;
     if (find_next_step_bfs(world, e, pr, pc, &nr, &nc)) {
         if (!(nr == e->row && nc == e->col) && is_empty_run(world, nr, nc, e->width)) {
@@ -612,198 +656,393 @@ void update_enemy_ai(Enemy *e, char world[ROWS][COLS+1], int pr, int pc) {
         }
     }
 
-    /* BFS failed or not used: fallback to greedy single-step (vertical then horizontal) */
-    int candidates[2][2] = {
-        { (pr < e->row) ? e->row - 1 : (pr > e->row) ? e->row + 1 : e->row, e->col },
-        { e->row, (pc < e->col) ? e->col - 1 : (pc > e->col) ? e->col + 1 : e->col }
-    };
-
-    for (int i = 0; i < 2; i++) {
-        int xr = candidates[i][0], xc = candidates[i][1];
-        if (xr == e->row && xc == e->col) continue;
-        if (is_empty_run(world, xr, xc, e->width)) {
-            remove_enemy_from_world(world, e);
-            e->row = xr; e->col = xc;
-            place_enemy_on_world(world, e);
-            e->last_move = t;
-            break;
-        }
+    int best_r = e->row, best_c = e->col;
+    int best_dist = abs(e->row - pr) + abs(e->col - pc);
+    const int drs[4] = {-1,1,0,0};
+    const int dcs[4] = {0,0,-1,1};
+    for (int i = 0; i < 4; ++i) {
+        int rr = e->row + drs[i], rc = e->col + dcs[i];
+        if (!is_empty_run(world, rr, rc, e->width)) continue;
+        int dd = abs(rr - pr) + abs(rc - pc);
+        if (dd < best_dist) { best_dist = dd; best_r = rr; best_c = rc; }
+    }
+    if (!(best_r == e->row && best_c == e->col)) {
+        remove_enemy_from_world(world, e);
+        e->row = best_r; e->col = best_c;
+        place_enemy_on_world(world, e);
+        e->last_move = t;
     }
 }
 
-// Enemy attempts to damage the player with an initial delay when contact starts.
-// Also manages attack_state visual animation: windup('x') and attack('X').
-// Returns 1 if damage was applied this tick, 0 otherwise.
+// Enemy attack logic
 int enemy_try_attack(Enemy *e, int pr, int pc, int *player_hp, char world[ROWS][COLS+1]) {
     if (!e->alive) return 0;
     int adj = (abs(e->row - pr) + abs(e->col - pc) <= 1);
     long t = now_us();
 
-    // First, clear visual attack state if its timer expired
     if (e->attack_state != 0 && t >= e->attack_state_until) {
         e->attack_state = 0;
-        // refresh map char
         remove_enemy_from_world(world, e);
         place_enemy_on_world(world, e);
     }
 
-    if (!adj) { // reset contact_time if no longer touching; clear pending attack-state
-        e->contact_time = 0;
-        return 0;
-    }
+    if (!adj) { e->contact_time = 0; return 0; }
 
-    // If first contact, set contact_time and set windup visual
     if (e->contact_time == 0) {
         e->contact_time = t;
-        e->attack_state = 1; // windup 'x'
-        e->attack_state_until = t + enemy_hit_delay(e); // windup lasts until hit window
-        // show windup on map
+        e->attack_state = 1;
+        e->attack_state_until = t + enemy_hit_delay(e);
         remove_enemy_from_world(world, e);
         place_enemy_on_world(world, e);
         return 0;
     }
 
-    // If enough time passed since contact_time, apply damage and show attack flash
     if ((t - e->contact_time) >= enemy_hit_delay(e)) {
-        // apply damage
-        *player_hp -= (e->dmg)*2; //Double damage - change '2' to adjust the amount of base damage
-        // set attack-state flash
-        e->attack_state = 2; // 'X'
+        int applied = e->is_boss ? (e->dmg * 3) : (e->dmg * 2);
+        *player_hp -= applied;
+        e->attack_state = 2;
         e->attack_state_until = t + enemy_attack_flash_time(e);
-        // update contact_time to now so next hit will be after hit_delay
         e->contact_time = t;
-        // update map to show 'X'
         remove_enemy_from_world(world, e);
         place_enemy_on_world(world, e);
         return 1;
     }
-
     return 0;
+}
+
+// ---------- Boss and bullets behavior ----------
+
+void bullets_init(void) {
+    for (int i = 0; i < MAX_BULLETS; ++i) bullets[i].alive = 0;
+}
+
+// spawn_bullet with start_delay_us (can be 0) and homing_until_us (absolute µs timestamp or 0)
+int spawn_bullet(int r, int c, int dr, int dc, int damage, int speed, int lifetime, long start_delay_us, long homing_until_us, char repr) {
+    for (int i = 0; i < MAX_BULLETS; ++i) {
+        if (!bullets[i].alive) {
+            bullets[i].alive = 1;
+            bullets[i].row = r;
+            bullets[i].col = c;
+            bullets[i].dr = dr; bullets[i].dc = dc;
+            bullets[i].damage = damage;
+            bullets[i].speed = speed;
+            bullets[i].last_move = now_us() + start_delay_us; // delayed start (also used as "visible after")
+            bullets[i].lifetime = lifetime;
+            bullets[i].homing_until = homing_until_us;
+            bullets[i].char_repr = repr;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Move bullets: return 1 if player hit
+int update_bullets(char world[ROWS][COLS+1], int *player_hp, int pr, int pc) {
+    int player_hit = 0;
+    long t = now_us();
+    for (int i = 0; i < MAX_BULLETS; ++i) {
+        if (!bullets[i].alive) continue;
+
+        // respect start delay: don't move until visible-after time arrives
+        if (t < bullets[i].last_move) continue;
+
+        int move_delay = 200000 / (bullets[i].speed > 0 ? bullets[i].speed : 1);
+        if ((t - bullets[i].last_move) < move_delay) continue;
+
+        bullets[i].last_move = t;
+        if (bullets[i].homing_until && t <= bullets[i].homing_until) {
+            int vr = pr - bullets[i].row;
+            int vc = pc - bullets[i].col;
+            if (vr < 0) bullets[i].dr = -1; else if (vr > 0) bullets[i].dr = 1; else bullets[i].dr = 0;
+            if (vc < 0) bullets[i].dc = -1; else if (vc > 0) bullets[i].dc = 1; else bullets[i].dc = 0;
+        }
+
+        int nr = bullets[i].row + bullets[i].dr;
+        int nc = bullets[i].col + bullets[i].dc;
+
+        bullets[i].lifetime--;
+        if (bullets[i].lifetime <= 0) { bullets[i].alive = 0; continue; }
+
+        if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) { bullets[i].alive = 0; continue; }
+        if (world[nr][nc] == '#') { bullets[i].alive = 0; continue; }
+
+        if (nr == pr && nc == pc) {
+            *player_hp -= bullets[i].damage;
+            bullets[i].alive = 0;
+            player_hit = 1;
+            continue;
+        }
+
+        bullets[i].row = nr; bullets[i].col = nc;
+    }
+    return player_hit;
+}
+
+// helper: check whether a straight ray from (r,c) in direction (dr,dc) is clear for 'dist' tiles (no walls)
+int is_clear_dir(const char world[ROWS][COLS+1], int r, int c, int dr, int dc, int dist) {
+    for (int i = 1; i <= dist; ++i) {
+        int rr = r + dr * i;
+        int cc = c + dc * i;
+        if (rr < 0 || rr >= ROWS || cc < 0 || cc >= COLS) return 0;
+        if (world[rr][cc] == '#') return 0;
+    }
+    return 1;
+}
+
+// Find a valid teleport among the configured 4 teleport coords that has at least one direction clear
+int pick_valid_teleport_from_table(const char world[ROWS][COLS+1], int pr, int pc, int *out_r, int *out_c) {
+    int table[4][2] = {
+        { BOSS_TP_R0, BOSS_TP_C0 },
+        { BOSS_TP_R1, BOSS_TP_C1 },
+        { BOSS_TP_R2, BOSS_TP_C2 },
+        { BOSS_TP_R3, BOSS_TP_C3 }
+    };
+    int clear_dist = 1; // require at least immediate neighbor free so bullets can spawn out
+    int best_r = -1, best_c = -1, best_dist = -1;
+    for (int i = 0; i < 4; ++i) {
+        int rr = table[i][0], cc = table[i][1];
+        if (rr <= 0 || rr >= ROWS-1 || cc <= 0 || cc >= COLS-1) continue;
+        if (world[rr][cc] == '#') continue;
+        int north = is_clear_dir(world, rr, cc, -1, 0, clear_dist);
+        int south = is_clear_dir(world, rr, cc, 1, 0, clear_dist);
+        int west  = is_clear_dir(world, rr, cc, 0, -1, clear_dist);
+        int east  = is_clear_dir(world, rr, cc, 0, 1, clear_dist);
+        if (!(north || south || west || east)) continue;
+        int d = abs(rr - pr) + abs(cc - pc);
+        if (d > best_dist) { best_dist = d; best_r = rr; best_c = cc; }
+    }
+    if (best_r != -1) { *out_r = best_r; *out_c = best_c; return 1; }
+    return 0;
+}
+
+// Boss behavior: teleport to one of configured coords (if valid) then shoot 360° in staggered bullets
+void update_boss_behavior(Enemy *boss, char world[ROWS][COLS+1], int pr, int pc) {
+    if (!boss || !boss->alive) return;
+    long t = now_us();
+
+    if (boss->boss_next_action == 0) boss->boss_next_action = t + 800000;
+
+    if (t < boss->boss_next_action) return;
+
+    // pick a teleport coord from table (prefer farthest from player) and validate it
+    int chosen_r = -1, chosen_c = -1;
+    if (!pick_valid_teleport_from_table(world, pr, pc, &chosen_r, &chosen_c)) {
+        // fallback: search whole map for any tile with at least one clear neighbor
+        int best_dist = -1;
+        for (int rr = 1; rr < ROWS-1; ++rr) {
+            for (int cc = 1; cc < COLS-1; ++cc) {
+                if (world[rr][cc] == '#') continue;
+                if (! (is_clear_dir(world, rr, cc, -1,0,1) || is_clear_dir(world, rr, cc,1,0,1) ||
+                       is_clear_dir(world, rr, cc,0,-1,1) || is_clear_dir(world, rr, cc,0,1,1)) ) continue;
+                int d = abs(rr - pr) + abs(cc - pc);
+                if (d > best_dist) { best_dist = d; chosen_r = rr; chosen_c = cc; }
+            }
+        }
+    }
+
+    if (chosen_r != -1) {
+        remove_enemy_from_world(world, boss);
+        boss->row = chosen_r;
+        boss->col = chosen_c;
+        place_enemy_on_world(world, boss);
+    }
+
+    // Burst: shot_count waves each containing full-circle bullets (BOSS_SHOT_DIRECTIONS)
+    int shot_waves = BOSS_SHOT_WAVES_MIN + (rand() % (BOSS_SHOT_WAVES_MAX - BOSS_SHOT_WAVES_MIN + 1));
+    int base_damage = boss->dmg / BOSS_BULLET_DAMAGE_DIV;
+    if (base_damage < 1) base_damage = 1;
+
+    int dir_count = BOSS_SHOT_DIRECTIONS;
+    double PI = acos(-1.0);
+    for (int w = 0; w < shot_waves; ++w) {
+        for (int i = 0; i < dir_count; ++i) {
+            double angle = 2.0 * PI * ((double)i / (double)dir_count) + (w * 0.1); // small offset per wave
+            int dr = (int)round(sin(angle));
+            int dc = (int)round(cos(angle));
+            if (dr == 0 && dc == 0) dc = 1; // ensure some direction
+
+            // skip if immediate neighbor is blocked
+            int sr = boss->row + dr;
+            int sc = boss->col + dc;
+            if (sr < 0 || sr >= ROWS || sc < 0 || sc >= COLS) continue;
+            if (world[sr][sc] == '#') continue;
+
+            // stagger: each bullet delayed by bullet_index * STAGGER, plus wave offset
+            long start_delay = (long)((w * dir_count + i) * (long)BOSS_SHOT_STAGGER_US);
+            // homing occasionally in phase 2
+            long homing_until_abs = 0;
+            if (boss->boss_phase >= 2 && (rand()%6)==0) {
+                homing_until_abs = now_us() + 800000; // homing active for 0.8s
+            }
+            // spawn bullet ONE STEP OUT so it doesn't cover the boss glyph
+            spawn_bullet(sr, sc, dr, dc, base_damage,
+                         BOSS_BULLET_BASE_SPEED + current_level/1, BOSS_BULLET_LIFETIME,
+                         start_delay, homing_until_abs, (dr==0?'-':(dc==0?'|':'*')));
+        }
+    }
+
+    // schedule next teleport/sequence
+    boss->boss_next_action = now_us() + BOSS_TELEPORT_BASE_DELAY_US + (rand() % BOSS_TELEPORT_VARIANCE_US);
+
+    // phase change when health is half
+    if (boss->hp <= (boss->max_hp/2) && boss->boss_phase == 1) {
+        boss->boss_phase = 2;
+        boss->speed += 1;
+        // tighten next action a bit
+        boss->boss_next_action = now_us() + (BOSS_TELEPORT_BASE_DELAY_US / 2);
+    }
 }
 
 // ---------- Level / map / setup helpers ----------
 
-// Predefined boss level map (level 3) — NOT generated
 const char *boss_map[ROWS] = {
     " ###################################### ",
     "##########                          ####",
-    "###        ###                         ##",
-    "##       ##   #          {N}            #",
-    "#       #                             ###",
+    "###                                     ##",
+    "##                                      #",
+    "#                                     ###",
     "#                                    ####",
     "##                                    ###",
-    "###             #                      ##",
-    "####           #                       ##",
-    "#####           ##    #         ####    #",
-    "#####             ###          #     #  #",
-    "#####                                #  #",
+    "###                                    ##",
+    "####                                   ##",
+    "#####           ##    #                 #",
+    "#####             ###                   #",
+    "#####                                   #",
     "####                                    #",
-    "##    ###                               #",
-    "##  #                                  #",
-    "#   #                                  #",
-    "##                                   ###",
-    "###       P                   ###   ####",
-    "####                     ###############",
+    "##                                      #",
+    "##                                     #",
+    "#                                      #",
+    "#                                      #",
+    "##        P                          ###",
+    "###                                #####",
     " ###################################### ",
 };
 
-// Clean world to spaces (non-wall outside)
-void init_blank_world(char world[ROWS][COLS+1]) {
-    for (int r = 0; r < ROWS; ++r) {
-        for (int c = 0; c < COLS; ++c) {
-            world[r][c] = ' ';
-        }
-        world[r][COLS] = '\0';
-    }
-}
-
-// copy boss_map to world
 void copy_boss_map(char world[ROWS][COLS+1]) {
     for (int r = 0; r < ROWS; ++r) {
-        // ensure boss_map[r] is COLS characters
         strncpy(world[r], boss_map[r], COLS);
         world[r][COLS] = '\0';
     }
 }
 
-// Setup the level: generate/copy map, place player, spawn enemies
 void setup_level(int level, char world[ROWS][COLS+1], int *pr, int *pc, Stats player_stats) {
-    // Clear enemies
     for (int i = 0; i < MAX_ENEMIES; ++i) enemies[i].alive = 0;
     enemy_count = 0;
+    bullets_init();
 
     if (level < 3) {
-        // Generate random map for levels 1 and 2
         generate_map(world, pr, pc);
 
-        // spawn counts tuned per level
         int base_enemies = (level == 1) ? 6 : 10;
         int elites = (level == 1) ? 1 : 3;
 
-        // spawn normals
-        for (int i = 0; i < base_enemies && enemy_count < MAX_ENEMIES; i++) {
+        for (int i = 0; i < base_enemies && enemy_count < MAX_ENEMIES; ++i) {
             Enemy e = spawn_enemy(world, 0, 0, *pr, *pc);
             if (e.alive) { enemies[enemy_count++] = e; place_enemy_on_world(world, &enemies[enemy_count-1]); }
         }
-        // spawn elites
-        for (int i = 0; i < elites && enemy_count < MAX_ENEMIES; i++) {
+        for (int i = 0; i < elites && enemy_count < MAX_ENEMIES; ++i) {
             Enemy e = spawn_enemy(world, 1, 0, *pr, *pc);
             if (e.alive) { enemies[enemy_count++] = e; place_enemy_on_world(world, &enemies[enemy_count-1]); }
         }
     } else {
-        // Level 3: boss level uses predefined map (no generator)
         copy_boss_map(world);
-        // find player (boss_map already has a 'P' placed)
-        if (!find_player(world, pr, pc)) { // fallback
-            *pr = ROWS/2; *pc = COLS/2;
-            world[*pr][*pc] = 'P';
-        }
+        if (!find_player(world, pr, pc)) { *pr = ROWS/2; *pc = COLS/2; world[*pr][*pc] = 'P'; }
 
-        // Create the boss at a fixed position if possible: find the "{N}" position in the map
         int boss_r = -1, boss_c = -1;
-        for (int r = 0; r < ROWS; ++r) {
-            for (int c = 0; c < COLS; ++c) {
-                if (world[r][c] == '{') { boss_r = r; boss_c = c; break; }
-            }
-            if (boss_r != -1) break;
-        }
-        // If boss location found, put boss enemy exactly there (col will be location of '{')
+        for (int r = 0; r < ROWS; ++r) for (int c = 0; c < COLS; ++c) if (world[r][c] == '{') { boss_r = r; boss_c = c; break; }
+
         if (boss_r != -1) {
             Enemy b = {0};
             b.is_boss = 1;
             b.alive = 1;
             b.last_move = b.last_hit = b.contact_time = b.attack_state_until = 0;
             b.attack_state = 0;
-            b.hp = 150 + level * 20;
-            b.dmg = 15 + level * 3;
-            b.speed = 4;
-            strcpy(b.shape, "{N}");
+            b.boss_next_action = 0;
+            b.boss_phase = 1;
+            b.max_hp = b.hp = 300 + level * 120;
+            b.dmg = 10 + level * 4;
+            b.speed = 3;
+            strcpy(b.shape, "N");
             b.width = (int)strlen(b.shape);
             b.row = boss_r;
             b.col = boss_c;
             enemies[enemy_count++] = b;
-            // ensure boss overwrites map chars
             place_enemy_on_world(world, &enemies[enemy_count-1]);
         } else {
-            // fallback: spawn boss randomly
             Enemy e = spawn_enemy(world, 0, 1, *pr, *pc);
             if (e.alive) { enemies[enemy_count++] = e; place_enemy_on_world(world, &enemies[enemy_count-1]); }
         }
     }
 }
 
+// ---------- Upgrade / XP UI ----------
+void show_upgrade_screen(Stats *player_stats) {
+    while (1) {
+        system("clear");
+        printf(BOLD BYELLOW "Level Complete!  XP: %d   Total XP: %d\n\n" RESET, player_xp, player_total_xp);
+        printf(BOLD GREEN"Your stats:\n");
+        printf(LGREEN"1) VGR: %d   (Increases max HP by +2 per VGR)\n", player_stats->VGR);
+        printf(LGREEN"2) STR: %d   (Increases damage)\n", player_stats->STR);
+        printf(LGREEN"3) SPD: %d   (Increases speed)\n", player_stats->SPD);
+        printf(LGREEN"4) INT: %d   (Increases mage damage)\n", player_stats->INT);
+        printf(LGREEN"5) LCK: %d   (Affects drop/chance)\n\n", player_stats->LCK);
+
+        int cost_vgr = 20 + player_stats->VGR * 2;
+        int cost_str = 20 + player_stats->STR * 2;
+        int cost_spd = 25 + player_stats->SPD * 3;
+        int cost_int = 20 + player_stats->INT * 2;
+        int cost_lck = 15 + player_stats->LCK * 1;
+
+        printf(LYELLOW"Upgrade costs (XP):\n");
+        printf(LYELLOW" [1] +1 VGR  -> %d XP\n", cost_vgr);
+        printf(LYELLOW" [2] +1 STR  -> %d XP\n", cost_str);
+        printf(LYELLOW" [3] +1 SPD  -> %d XP\n", cost_spd);
+        printf(LYELLOW" [4] +1 INT  -> %d XP\n", cost_int);
+        printf(LYELLOW" [5] +1 LCK  -> %d XP\n", cost_lck);
+        printf(LYELLOW"\n [c] Continue to next level (or press q to quit)\n");
+        printf(GREY"Choose upgrade or action: ");
+
+        char choice = '\0';
+        while (kbhit()) (void)getchar();
+        scanf(" %c", &choice);
+
+        if (choice == 'q') break;
+        else if (choice == 'c') break;
+        else if (choice == '1') {
+            if (player_xp >= cost_vgr) { player_xp -= cost_vgr; player_stats->VGR += 1; player_hp_global = 30 + player_stats->VGR * 2; }
+            else { printf(LRED"\nNot enough XP. Press any key..."); getchar(); getchar(); }
+        } else if (choice == '2') {
+            if (player_xp >= cost_str) { player_xp -= cost_str; player_stats->STR += 1; }
+            else { printf(LRED"\nNot enough XP. Press any key..."); getchar(); getchar(); }
+        } else if (choice == '3') {
+            if (player_xp >= cost_spd) { player_xp -= cost_spd; player_stats->SPD += 1; }
+            else { printf(LRED"\nNot enough XP. Press any key..."); getchar(); getchar(); }
+        } else if (choice == '4') {
+            if (player_xp >= cost_int) { player_xp -= cost_int; player_stats->INT += 1; }
+            else { printf(LRED"\nNot enough XP. Press any key..."); getchar(); getchar(); }
+        } else if (choice == '5') {
+            if (player_xp >= cost_lck) { player_xp -= cost_lck; player_stats->LCK += 1; }
+            else { printf(LRED"\nNot enough XP. Press any key..."); getchar(); getchar(); }
+        } else {
+            printf(LRED"\nInvalid input. Press any key..."); getchar(); getchar();
+        }
+    }
+}
+
 // ---------- MAIN ----------
 int main(void) {
-
     srand((unsigned)time(NULL));
 
-    // ---------- Map (ASCII art intact) ----------
     char world[ROWS][COLS+1];
-    int pr = 0, pc = 0;
+    int pr, pc;         // player row/col
+    int level = 1;      // current level
 
-    // ---- Class select ----
+
     char u_input, player_class[25];
     Stats player_stats;
+
+    // Default modifiers (as before)
+    mods = (ClassModifiers){1.0f, 1.0f, 1.0f};
 
     // ASCII banner
     printf(
@@ -837,15 +1076,14 @@ int main(void) {
         );
         scanf(" %c", &u_input);
         switch (u_input) {
-            case '1': strcpy(player_class,"Cannoneer");   player_stats=(Stats){20,20,10, 2, 5};mods = (ClassModifiers){0.8, 1.0, 1.5}; /*slower, but hits hard*/; break;
-            case '2': strcpy(player_class,"Gunslinger");  player_stats=(Stats){15,15,26, 1, 6};mods = (ClassModifiers){1.3, 1.5, 0.8}; /*fast, low damage*/; break;
-            case '3': strcpy(player_class,"Sorcerer"); player_stats=(Stats){10, 6,15,20, 8};mods = (ClassModifiers){1.0, 1.2, 1.2}; /*balanced, mid damage*/; break;
+            case '1': strcpy(player_class,"Cannoneer");   player_stats=(Stats){20,20,10, 2, 5};mods = (ClassModifiers){0.8, 1.0, 1.5}; break;
+            case '2': strcpy(player_class,"Gunslinger");  player_stats=(Stats){15,15,26, 1, 6};mods = (ClassModifiers){1.3, 1.5, 0.8}; break;
+            case '3': strcpy(player_class,"Sorcerer"); player_stats=(Stats){10, 6,15,20, 8};mods = (ClassModifiers){1.0, 1.2, 1.2}; break;
             default:  player_class[0]='\0';
         }
         if (!player_class[0]) puts(RED BOLD"\nInvalid choice, please try again!\n"NORMAL);
     } while (!player_class[0]);
 
-    // Show chosen class & stats
     printf(BOLD GREEN "\nYou have chosen: %s\n\n" NORMAL, player_class);
     printf(NORMAL BGREEN"Your stats:\nVGR: %d | STR: %d | SPD: %d | INT: %d | LCK: %d\n",
            player_stats.VGR, player_stats.STR, player_stats.SPD,
@@ -858,43 +1096,46 @@ int main(void) {
     current_level = 1;
     setup_level(current_level, world, &pr, &pc, player_stats);
 
-    // ---- Player HP ----
+    // Player HP
     player_hp_global = 30 + player_stats.VGR * 2;
 
-    // ---- Cooldowns (player) ----
     long last_action = 0;
-    int action_locked = 0;   // 0=ready, 1=cooldown active
-    int cooldown_type = 0;   // 1=move, 2=attack
+    int action_locked = 0;
+    int cooldown_type = 0;
 
-    // ---- Game loop ----
+    // Game loop
     while (1) {
-        // Draw frame with HUD
         draw_world_with_hud(world, player_hp_global);
 
-        // ENEMY PHASE
-        for (int i = 0; i < enemy_count; i++) {
-            Enemy *e = &enemies[i];
-            if (!e->alive) continue;
-
-            // Try to attack if touching player (attack logic delays the first hit and shows visuals)
-            enemy_try_attack(e, pr, pc, &player_hp_global, world);
+        // First: update bullets (boss projectiles)
+        if (update_bullets(world, &player_hp_global, pr, pc)) {
             if (player_hp_global <= 0) { system("clear"); puts("YOU DIED!"); return 0; }
-
-            // Move toward player (BFS pathfinding + fallback greedy)
-            update_enemy_ai(e, world, pr, pc);
         }
 
-        // Win condition for level: all dead? -> advance to next level
-        int any_alive = 0; for (int i = 0; i < enemy_count; i++) if (enemies[i].alive) { any_alive = 1; break; }
+        // Enemy phase: boss behavior and others
+        for (int i = 0; i < enemy_count; ++i) {
+            Enemy *e = &enemies[i];
+            if (!e->alive) continue;
+            if (e->is_boss) {
+                update_boss_behavior(e, world, pr, pc);
+            } else {
+                enemy_try_attack(e, pr, pc, &player_hp_global, world);
+                if (player_hp_global <= 0) { system("clear"); puts("YOU DIED!"); return 0; }
+                update_enemy_ai(e, world, pr, pc);
+            }
+        }
+
+        // Win condition: all dead?
+        int any_alive = 0;
+        for (int i = 0; i < enemy_count; ++i) if (enemies[i].alive) { any_alive = 1; break; }
         if (!any_alive) {
-            // If less than level 3, advance; if level 3, final victory
+            show_upgrade_screen(&player_stats);
+            player_hp_global = 30 + player_stats.VGR * 2;
             if (current_level < 3) {
                 current_level++;
-                // show a simple level-clear message
                 system("clear");
                 printf(BGREEN "Level %d cleared! Preparing Level %d...\n" RESET, current_level-1, current_level);
                 usleep(800000);
-                // Setup next level
                 setup_level(current_level, world, &pr, &pc, player_stats);
                 continue;
             } else {
@@ -904,12 +1145,10 @@ int main(void) {
             }
         }
 
-        // PLAYER PHASE: handle cooldown & input
+        // PLAYER PHASE: cooldown & input
         if (action_locked) {
-            while (kbhit()) (void)getchar(); // drain buffer
-            int delay = (cooldown_type == 1) ?
-              movement_delay(player_stats, mods.move_speed_mult) :
-              attack_delay(player_stats, mods.atk_speed_mult);
+            while (kbhit()) (void)getchar();
+            int delay = (cooldown_type == 1) ? movement_delay(player_stats, mods.move_speed_mult) : attack_delay(player_stats, mods.atk_speed_mult);
             if ((now_us() - last_action) > delay) action_locked = 0;
             usleep(50000);
             continue;
@@ -920,8 +1159,16 @@ int main(void) {
             if (c == 'q') break;
             long t = now_us();
 
-            // update facing immediately
             if (c == 'w' || c == 'a' || c == 's' || c == 'd') last_dir = c;
+
+            // cheat code
+            if (c == 'p') { // cheat: go straight to boss
+                printf(GREEN BOLD "\nCHEAT ACTIVATED: Jumping to Boss Level!\n" NORMAL);
+                level = 3;
+                current_level = 3; // keep global scaling consistent
+                setup_level(level, world, &pr, &pc, player_stats);
+                continue; // skip rest of this tick
+            }
 
             // Movement
             if (c == 'w' || c == 'a' || c == 's' || c == 'd') {
@@ -936,18 +1183,10 @@ int main(void) {
             }
             // Attack
             else if (c == 'k' || c == 'K') {
-                if (strcmp(player_class, "Sorcerer") == 0) {
-                    int dmg = calc_damage(player_class, player_stats, mods);
-                    mage_attack(world, pr, pc, last_dir, dmg);
-                }
-                else if (strcmp(player_class, "Gunslinger") == 0) {
-                    int dmg = calc_damage(player_class, player_stats, mods);
-                    gun_attack(world, pr, pc, last_dir, dmg);
-                }
-                else{
-                    int dmg = calc_damage(player_class, player_stats, mods);
-                    can_attack(world, pr, pc, last_dir, dmg);
-                }
+                int dmg = calc_damage(player_class, player_stats, mods);
+                if (strcmp(player_class, "Sorcerer") == 0) mage_attack(world, pr, pc, last_dir, dmg);
+                else if (strcmp(player_class, "Gunslinger") == 0) gun_attack(world, pr, pc, last_dir, dmg);
+                else can_attack(world, pr, pc, last_dir, dmg);
                 last_action = t; action_locked = 1; cooldown_type = 2;
             }
         }
