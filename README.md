@@ -5,7 +5,7 @@ Explore dungeons, fight enemies, choose your class, and survive in a **Souls-lik
 
 
 
-### 🔮 *Version table*
+### *Version table*
 | Version | Date |                     Features                     |
 |---------|------|--------------------------------------------------|
 | 0.01    | Aug 24 2025  | Structure of the main game, moving enemies, 3 classes to choose, basic AI (BFS) for path finding. |
@@ -14,11 +14,11 @@ Explore dungeons, fight enemies, choose your class, and survive in a **Souls-lik
 
 
 
+### Supported platforms: 
+-----|_ Linux platforms
 
 
 
 
 
-
-from:
-  Mobin – 2025
+Mobin – 2025
