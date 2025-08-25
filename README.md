@@ -15,7 +15,9 @@ Explore dungeons, fight enemies, choose your class, and survive in a **Souls-lik
 
 
 ### Supported platforms: 
------|_ Linux platforms
+
+* Linux
+  * All Linux Enviroments
 
 
 
