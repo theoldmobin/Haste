@@ -1,13 +1,14 @@
 // "HASTE"
-//
+
 // ASCII-ART TEXT-BASED ADVENTURE RPG GAME
 // BY MOBIN - 2025
-
 
 // Fixed: 
 //  - attack rendering no longer flashes whole screen grey (uses draw_world_with_hud)
 //  - projectiles/bullets are colored yellow
-
+//
+// NOTE: sound code is still commented out as in the user-supplied source.
+//       If you want terminal beeps you can install `beep` and enable sound calls.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,6 +64,8 @@ void* soundtrack(void* arg) {
 
 // ---------- Globals ----------
 static int player_hp_global = 0; // made global so attack functions can call draw_world_with_hud
+static int current_level = 1;    // current level (1..3)
+static int player_xp = 0;        // placeholder for future xp/upgrade system
 
 // ---------- Stats ----------
 typedef struct {
@@ -84,7 +87,7 @@ typedef struct {
     int dmg;
     int speed;         // how often they move (higher = faster)
     int row, col;      // top-left cell
-    char shape[3];
+    char shape[4];     // allow up to 3 chars + null (boss "{N}")
     int is_elite;
     int is_boss;
     long last_move;    // µs timestamp for movement cooldown
@@ -157,6 +160,75 @@ int kbhit(void) {
 }
 
 // ---------- World helpers ----------
+
+// helper: fill world array with '#' walls
+void fill_world_with_walls(char world[ROWS][COLS+1]) {
+    for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) world[r][c] = '#';
+        world[r][COLS] = '\0';
+    }
+}
+
+// random-room map generator: places several rectangular rooms and connects them with corridors.
+void generate_map(char world[ROWS][COLS+1], int *out_pr, int *out_pc) {
+    fill_world_with_walls(world);
+
+    // Simple list of room centers to connect
+    int room_centers[8][2];
+    int room_count = 0;
+    int max_rooms = 6;
+
+    for (int r = 0; r < ROWS; ++r) for (int c = 0; c < COLS; ++c) world[r][c] = '#';
+
+    // Create a few rooms
+    for (int i = 0; i < max_rooms; ++i) {
+        int rw = 4 + rand()%8;  // width
+        int rh = 3 + rand()%4;  // height
+        int rx = 1 + rand() % (COLS - rw - 2);
+        int ry = 1 + rand() % (ROWS - rh - 2);
+
+        // Carve room
+        for (int y = ry; y < ry + rh; ++y) {
+            for (int x = rx; x < rx + rw; ++x) {
+                world[y][x] = ' ';
+            }
+        }
+        // record center
+        room_centers[room_count][0] = ry + rh/2;
+        room_centers[room_count][1] = rx + rw/2;
+        room_count++;
+    }
+
+    // Connect rooms with straight corridors (L-shaped)
+    for (int i = 1; i < room_count; ++i) {
+        int y1 = room_centers[i-1][0], x1 = room_centers[i-1][1];
+        int y2 = room_centers[i][0], x2 = room_centers[i][1];
+
+        int cx = x1;
+        while (cx != x2) {
+            world[y1][cx] = ' ';
+            if (x2 > cx) cx++; else cx--;
+        }
+        int cy = y1;
+        while (cy != y2) {
+            world[cy][x2] = ' ';
+            if (y2 > cy) cy++; else cy--;
+        }
+    }
+
+    // Place player in first room center
+    if (room_count > 0) {
+        int pr = room_centers[0][0], pc = room_centers[0][1];
+        world[pr][pc] = 'P';
+        *out_pr = pr; *out_pc = pc;
+    } else {
+        // fallback: center of map
+        int pr = ROWS/2, pc = COLS/2;
+        world[pr][pc] = 'P';
+        *out_pr = pr; *out_pc = pc;
+    }
+}
+
 void draw_world(char world[ROWS][COLS+1]) {
     CLR();
     for (int r = 0; r < ROWS; r++) puts(world[r]);
@@ -174,20 +246,23 @@ void draw_world_with_hud(char world[ROWS][COLS+1], int hp) {
                 printf(YELLOW "%c" RESET, tile);
             }
             else if (tile == 'P') {
-                printf(BBLUE "P" RESET); // player lblue
+                printf(BOLD BBLUE "P" RESET NORMAL); // player lblue
             } else if (tile == 'M' || tile == 'Z' || tile == 'X' || tile == 'Y') {
                 printf(BRED "%c" RESET, tile);  // normal enemies l red
             } else if (tile == 'E') {
                 printf(RED "E" RESET);    // elite
+            } else if (tile == '{' || tile == '}' || tile == 'N') {
+                // Boss shows as YELLOW for any of its characters
+                printf(BOLD YELLOW "%c" RESET NORMAL, tile);
             } else if (tile == 'B') {
-                printf(MAGENTA "B" RESET);   // boss MAGENTA
+                printf(MAGENTA "B" RESET);   // previous boss char (kept for compatibility)
             } else if (tile == '#') {
                 printf(GREY "#" RESET);          // walls grey
             } else {
                 printf("%c", tile);
             }
         }
-        if (r == 0) printf(BOLD RED "   ♡ HP: %d", hp);
+        if (r == 0) printf(BOLD RED "   ♡ HP: %d" RESET, hp);
         printf("\n");
     }
 }
@@ -453,28 +528,31 @@ Enemy spawn_enemy(char world[ROWS][COLS+1], int is_elite, int is_boss, int pr, i
     e.attack_state = 0;
 
     if (is_boss) {
-        e.hp = 60; e.dmg = 10; e.speed = 5; strcpy(e.shape, "B");
+        e.hp = 60 + current_level * 10;
+        e.dmg = 10 + current_level * 2;
+        e.speed = 5;
+        strcpy(e.shape, "{N}");
     } else if (is_elite) {
-        e.hp = 20 + rand()%15;
-        e.dmg = 5 + rand()%3;
+        e.hp = 20 + rand()%15 + current_level * 2;
+        e.dmg = 5 + rand()%3 + current_level;
         e.speed = 3 + rand()%2;
         strcpy(e.shape, "EE");   // two-char elite
     } else {
-        e.hp = 8 + rand()%8;
-        e.dmg = 2 + rand()%2;
+        e.hp = 8 + rand()%8 + current_level;
+        e.dmg = 2 + rand()%2 + (current_level>1 ? 1 : 0);
         e.speed = 2 + rand()%3;
         e.shape[0] = "MZXY"[rand()%4]; e.shape[1] = '\0';
     }
     e.width = (int)strlen(e.shape);
 
     // Place enemy away from player on empty run
-    int tries = 200;
+    int tries = 400;
     do {
         e.row = rand() % ROWS;
         e.col = rand() % (COLS - e.width);
     } while (--tries &&
              (!is_empty_run(world, e.row, e.col, e.width) ||
-              (abs(e.row - pr) + abs(e.col - pc) < 6)));
+              (abs(e.row - pr) + abs(e.col - pc) < 4))); // closer threshold slightly reduced for density
 
     if (!tries) e.alive = 0; // placement failed
     return e;
@@ -603,34 +681,125 @@ int enemy_try_attack(Enemy *e, int pr, int pc, int *player_hp, char world[ROWS][
     return 0;
 }
 
+// ---------- Level / map / setup helpers ----------
+
+// Predefined boss level map (level 3) — NOT generated
+const char *boss_map[ROWS] = {
+    " ###################################### ",
+    "##########                          ####",
+    "###        ###                         ##",
+    "##       ##   #          {N}            #",
+    "#       #                             ###",
+    "#                                    ####",
+    "##                                    ###",
+    "###             #                      ##",
+    "####           #                       ##",
+    "#####           ##    #         ####    #",
+    "#####             ###          #     #  #",
+    "#####                                #  #",
+    "####                                    #",
+    "##    ###                               #",
+    "##  #                                  #",
+    "#   #                                  #",
+    "##                                   ###",
+    "###       P                   ###   ####",
+    "####                     ###############",
+    " ###################################### ",
+};
+
+// Clean world to spaces (non-wall outside)
+void init_blank_world(char world[ROWS][COLS+1]) {
+    for (int r = 0; r < ROWS; ++r) {
+        for (int c = 0; c < COLS; ++c) {
+            world[r][c] = ' ';
+        }
+        world[r][COLS] = '\0';
+    }
+}
+
+// copy boss_map to world
+void copy_boss_map(char world[ROWS][COLS+1]) {
+    for (int r = 0; r < ROWS; ++r) {
+        // ensure boss_map[r] is COLS characters
+        strncpy(world[r], boss_map[r], COLS);
+        world[r][COLS] = '\0';
+    }
+}
+
+// Setup the level: generate/copy map, place player, spawn enemies
+void setup_level(int level, char world[ROWS][COLS+1], int *pr, int *pc, Stats player_stats) {
+    // Clear enemies
+    for (int i = 0; i < MAX_ENEMIES; ++i) enemies[i].alive = 0;
+    enemy_count = 0;
+
+    if (level < 3) {
+        // Generate random map for levels 1 and 2
+        generate_map(world, pr, pc);
+
+        // spawn counts tuned per level
+        int base_enemies = (level == 1) ? 6 : 10;
+        int elites = (level == 1) ? 1 : 3;
+
+        // spawn normals
+        for (int i = 0; i < base_enemies && enemy_count < MAX_ENEMIES; i++) {
+            Enemy e = spawn_enemy(world, 0, 0, *pr, *pc);
+            if (e.alive) { enemies[enemy_count++] = e; place_enemy_on_world(world, &enemies[enemy_count-1]); }
+        }
+        // spawn elites
+        for (int i = 0; i < elites && enemy_count < MAX_ENEMIES; i++) {
+            Enemy e = spawn_enemy(world, 1, 0, *pr, *pc);
+            if (e.alive) { enemies[enemy_count++] = e; place_enemy_on_world(world, &enemies[enemy_count-1]); }
+        }
+    } else {
+        // Level 3: boss level uses predefined map (no generator)
+        copy_boss_map(world);
+        // find player (boss_map already has a 'P' placed)
+        if (!find_player(world, pr, pc)) { // fallback
+            *pr = ROWS/2; *pc = COLS/2;
+            world[*pr][*pc] = 'P';
+        }
+
+        // Create the boss at a fixed position if possible: find the "{N}" position in the map
+        int boss_r = -1, boss_c = -1;
+        for (int r = 0; r < ROWS; ++r) {
+            for (int c = 0; c < COLS; ++c) {
+                if (world[r][c] == '{') { boss_r = r; boss_c = c; break; }
+            }
+            if (boss_r != -1) break;
+        }
+        // If boss location found, put boss enemy exactly there (col will be location of '{')
+        if (boss_r != -1) {
+            Enemy b = {0};
+            b.is_boss = 1;
+            b.alive = 1;
+            b.last_move = b.last_hit = b.contact_time = b.attack_state_until = 0;
+            b.attack_state = 0;
+            b.hp = 150 + level * 20;
+            b.dmg = 15 + level * 3;
+            b.speed = 4;
+            strcpy(b.shape, "{N}");
+            b.width = (int)strlen(b.shape);
+            b.row = boss_r;
+            b.col = boss_c;
+            enemies[enemy_count++] = b;
+            // ensure boss overwrites map chars
+            place_enemy_on_world(world, &enemies[enemy_count-1]);
+        } else {
+            // fallback: spawn boss randomly
+            Enemy e = spawn_enemy(world, 0, 1, *pr, *pc);
+            if (e.alive) { enemies[enemy_count++] = e; place_enemy_on_world(world, &enemies[enemy_count-1]); }
+        }
+    }
+}
+
 // ---------- MAIN ----------
 int main(void) {
 
     srand((unsigned)time(NULL));
 
     // ---------- Map (ASCII art intact) ----------
-    char world[ROWS][COLS+1] = {
-        " ###################################### ",
-        "##########         ###########      ####",
-        "###                    ####           ##",
-        "##                                     #",
-        "#     ###                            ###",
-        "#      #######      ####           #####",
-        "##        ####     ##                ###",
-        "###                #                  ##",
-        "####                                  ##",
-        "#####                         ######   #",
-        "#####         ###             ##       #",
-        "#####      #####              #        #",
-        "####                                   #",
-        "##    ###                #####         #",
-        "##  #                   ###            #",
-        "#   #    ######         #             ##",
-        "##                                   ###",
-        "###       P   ####            ###   ####",
-        "####            #        ###############",
-        " ###################################### ",
-    };
+    char world[ROWS][COLS+1];
+    int pr = 0, pc = 0;
 
     // ---- Class select ----
     char u_input, player_class[25];
@@ -644,6 +813,7 @@ int main(void) {
         "░░███   ░░███                    ░░███             \n"
         " ░███    ░███   ██████    █████  ███████    ██████ \n"
         " ░███████████  ░░░░░███  ███░░  ░░░███░    ███░░███\n"
+        YELLOW
         " ░███░░░░░███   ███████ ░░█████   ░███    ░███████ \n"
         " ░███    ░███  ███░░███  ░░░░███  ░███ ███░███░░░  \n"
         " █████   █████░░████████ ██████   ░░█████ ░░██████ \n"
@@ -684,26 +854,12 @@ int main(void) {
     scanf(" %c", &u_input);
     system("clear");
 
-    // ---- Find player ----
-    int pr = 0, pc = 0;
-    if (!find_player(world, &pr, &pc)) { fprintf(stderr, "No 'P' on the map!\n"); return 1; }
+    // Setup first level
+    current_level = 1;
+    setup_level(current_level, world, &pr, &pc, player_stats);
 
     // ---- Player HP ----
     player_hp_global = 30 + player_stats.VGR * 2;
-
-    // ---- Spawn enemies (luck affects difficulty) ----
-    int base_enemies = 8;
-    int elites = (player_stats.LCK >= 8) ? 1 : (player_stats.LCK >= 5) ? 2 : 3;
-    enemy_count = 0;
-
-    for (int i = 0; i < base_enemies && enemy_count < MAX_ENEMIES; i++) {
-        Enemy e = spawn_enemy(world, 0, 0, pr, pc);
-        if (e.alive) { enemies[enemy_count++] = e; place_enemy_on_world(world, &enemies[enemy_count-1]); }
-    }
-    for (int i = 0; i < elites && enemy_count < MAX_ENEMIES; i++) {
-        Enemy e = spawn_enemy(world, 1, 0, pr, pc);
-        if (e.alive) { enemies[enemy_count++] = e; place_enemy_on_world(world, &enemies[enemy_count-1]); }
-    }
 
     // ---- Cooldowns (player) ----
     long last_action = 0;
@@ -728,9 +884,25 @@ int main(void) {
             update_enemy_ai(e, world, pr, pc);
         }
 
-        // Win condition: all dead?
+        // Win condition for level: all dead? -> advance to next level
         int any_alive = 0; for (int i = 0; i < enemy_count; i++) if (enemies[i].alive) { any_alive = 1; break; }
-        if (!any_alive) { system("clear"); puts("All enemies defeated!"); break; }
+        if (!any_alive) {
+            // If less than level 3, advance; if level 3, final victory
+            if (current_level < 3) {
+                current_level++;
+                // show a simple level-clear message
+                system("clear");
+                printf(BGREEN "Level %d cleared! Preparing Level %d...\n" RESET, current_level-1, current_level);
+                usleep(800000);
+                // Setup next level
+                setup_level(current_level, world, &pr, &pc, player_stats);
+                continue;
+            } else {
+                system("clear");
+                printf(BGREEN "You defeated the Elite Knight! All levels cleared!\n" RESET);
+                break;
+            }
+        }
 
         // PLAYER PHASE: handle cooldown & input
         if (action_locked) {
@@ -784,6 +956,6 @@ int main(void) {
     }
 
     system("clear");
-    printf(BRED "Goodbye, %s.\n", player_class);
+    printf(BRED "Goodbye, %s.\n" RESET, player_class);
     return 0;
 }
